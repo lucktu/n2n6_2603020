@@ -1026,6 +1026,9 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( !is_empty_ip_address(&eee->my_public_sock) &&
          same_public_ip(&eee->my_public_sock, &peer->sock) ) return;
 
+    /* Skip punch if address family mismatch - no direct path possible */
+    if ( peer->sock.family != eee->supernode.family ) return;
+
     peer->punch_start_time = time(NULL);
     peer->last_punch_probe = peer->punch_start_time;
     send_probe(eee, &peer->sock, peer->mac_addr);
@@ -1065,9 +1068,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     (now - scan->punch_start_time) <= 5 &&
                     (now - scan->last_punch_probe) >= 1 )
         {
-            /* Retransmit PROBE every 1s for first 5s to improve NAT punch success */
-            send_probe(eee, &scan->sock, scan->mac_addr);
-            scan->last_punch_probe = now;
+            /* Retransmit PROBE every 1s for first 5s - skip if family mismatch */
+            if ( scan->sock.family == eee->supernode.family ) {
+                send_probe(eee, &scan->sock, scan->mac_addr);
+                scan->last_punch_probe = now;
+            }
         } else if ( scan->punch_failed &&
                     (now - scan->punch_reset_time) > 300 )
         {
@@ -1103,6 +1108,13 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
     while ( scan ) {
         struct peer_info *next = scan->next;
         time_t idle = now - scan->last_seen;
+
+        /* Skip keepalive for peers with mismatched address family - relay only, no direct path */
+        if ( scan->sock.family != eee->supernode.family ) {
+            prev = scan;
+            scan = next;
+            continue;
+        }
 
         if ( scan->last_probe_sent == 0 ) {
             /* No probe sent yet: send one if idle too long */
