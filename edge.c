@@ -31,6 +31,7 @@
 #include "minilzo.h"
 #include "random.h"
 #include "string.h"
+#include "upnp.h"
 
 #ifdef _WIN32
 #include <iphlpapi.h>
@@ -88,6 +89,17 @@ typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 static int default_ip_assignment = 0;
 static int initial_connection_complete = 0;
 
+/* Global flag set by signal handler to request graceful shutdown */
+static volatile int g_edge_running = 1;
+
+#ifndef _WIN32
+#include <signal.h>
+static void edge_signal_handler(int sig) {
+    (void)sig;
+    g_edge_running = 0;
+}
+#endif
+
 /** Main structure type for edge. */
 struct n2n_edge
 {
@@ -141,6 +153,9 @@ struct n2n_edge
 
     n2n_sock_t          local_sock;             /**< LAN address for same-NAT direct connect */
     int                 local_sock_ena;         /**< 1 if local_sock is valid */
+
+    /* UPnP/NAT-PMP */
+    uint16_t            upnp_mapped_port;       /**< External port mapped via UPnP/NAT-PMP, 0 if none */
 
     /* Statistics */
     size_t              tx_p2p;
@@ -395,6 +410,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->drop_multicast = 1;
     eee->known_peers    = NULL;
     eee->pending_peers  = NULL;
+    eee->upnp_mapped_port = 0;
 #ifdef _WIN32
     InitializeCriticalSection(&eee->peers_lock);
     eee->keep_running   = 1;
@@ -489,6 +505,14 @@ static void edge_deinit(n2n_edge_t * eee)
 
     if ( eee->mgmt_sock != -1 )
         closesocket(eee->mgmt_sock);
+
+    /* Remove UPnP/NAT-PMP port mapping on exit */
+    if (eee->upnp_mapped_port != 0) {
+        traceEvent(TRACE_NORMAL, "Removing UPnP/NAT-PMP port mapping for port %u",
+                   (unsigned)eee->upnp_mapped_port);
+        upnp_unmap_port(eee->upnp_mapped_port);
+        eee->upnp_mapped_port = 0;
+    }
 
     clear_peer_list( &(eee->pending_peers) );
     clear_peer_list( &(eee->known_peers) );
@@ -3135,6 +3159,13 @@ int main(int argc, char* argv[])
     cap_free(caps_original);
 #endif
 
+#ifndef _WIN32
+    /* Register signal handlers early so SIGTERM/SIGINT always trigger
+     * graceful shutdown and UPnP port cleanup, even during startup. */
+    signal(SIGTERM, edge_signal_handler);
+    signal(SIGINT,  edge_signal_handler);
+#endif
+
     if (-1 == edge_init(&eee) ) {
         traceEvent( TRACE_ERROR, "Failed in edge_init" );
         exit(1);
@@ -3685,6 +3716,38 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     traceEvent(TRACE_NORMAL, "edge started");
 
+    /* Attempt UPnP/NAT-PMP port mapping so external peers can reach us.
+     * This is compiled in by default and runs automatically at startup.
+     * Failure is non-fatal - edge continues without port mapping. */
+    {
+        /* Determine the actual bound local port (may differ from local_port if 0) */
+        uint16_t actual_port = 0;
+        if (local_port > 0) {
+            actual_port = (uint16_t)local_port;
+        } else {
+            /* OS assigned a random port - read it back from the socket */
+            struct sockaddr_in bound;
+            socklen_t blen = sizeof(bound);
+            if (getsockname(eee.udp_sock, (struct sockaddr*)&bound, &blen) == 0)
+                actual_port = ntohs(bound.sin_port);
+        }
+
+        if (actual_port > 0) {
+            uint16_t mapped = 0;
+            traceEvent(TRACE_INFO, "UPnP/NAT-PMP: attempting port mapping for UDP port %u",
+                       (unsigned)actual_port);
+            if (upnp_map_port(actual_port, actual_port, &mapped) == UPNP_OK) {
+                traceEvent(TRACE_NORMAL,
+                           "UPnP/NAT-PMP: mapped UDP port %u",
+                           (unsigned)mapped);
+                eee.upnp_mapped_port = mapped;
+            } else {
+                traceEvent(TRACE_INFO,
+                           "UPnP/NAT-PMP: no gateway found or mapping failed (NAT traversal via supernode only)");
+            }
+        }
+    }
+
     set_localip(&eee);
     update_supernode_reg(&eee, n2n_now() );
 
@@ -3697,6 +3760,7 @@ static int run_loop(n2n_edge_t * eee )
     size_t numPurged;
     time_t lastIfaceCheck=0;
     time_t lastTransop=0;
+    time_t lastUpnpRenew=0;
     int   retval = 0;
 
 #ifdef _WIN32
@@ -3710,7 +3774,7 @@ static int run_loop(n2n_edge_t * eee )
      * readFromIPSocket() or readFromTAPSocket()
      */
 
-    while(keep_running)
+    while(keep_running && g_edge_running)
     {
         int rc, max_sock = 0;
         fd_set socket_mask;
@@ -3815,6 +3879,28 @@ static int run_loop(n2n_edge_t * eee )
             traceEvent(TRACE_NORMAL, "Re-checking dynamic IP address.");
             tuntap_get_address( &(eee->device) );
             lastIfaceCheck = nowTime;
+        }
+
+        /* Renew UPnP/NAT-PMP lease before it expires */
+        if (eee->upnp_mapped_port != 0 &&
+            (nowTime - lastUpnpRenew) > UPNP_RENEW_THRESHOLD)
+        {
+            /* Determine actual local port from socket */
+            uint16_t local_port = eee->upnp_mapped_port;
+            struct sockaddr_in bound;
+            socklen_t blen = sizeof(bound);
+            if (getsockname(eee->udp_sock, (struct sockaddr*)&bound, &blen) == 0)
+                local_port = ntohs(bound.sin_port);
+
+            if (upnp_renew_port(local_port, eee->upnp_mapped_port) == UPNP_OK) {
+                traceEvent(TRACE_INFO, "UPnP/NAT-PMP: lease renewed for port %u",
+                           (unsigned)eee->upnp_mapped_port);
+            } else {
+                traceEvent(TRACE_WARNING,
+                           "UPnP/NAT-PMP: lease renewal failed for port %u",
+                           (unsigned)eee->upnp_mapped_port);
+            }
+            lastUpnpRenew = nowTime;
         }
 
     } /* while */

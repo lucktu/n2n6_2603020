@@ -98,6 +98,7 @@ add_library(n2n_core STATIC
         transform_speck.c
         n2n_keyfile.c
         minilzo.c
+        upnp.c
         tuntap_freebsd.c
         tuntap_netbsd.c
         tuntap_linux.c
@@ -128,7 +129,7 @@ add_custom_command(
 endif(DEFINED WIN32)
 
 if(WIN32)
-  target_link_libraries(n2n_core bcrypt)
+  target_link_libraries(n2n_core bcrypt iphlpapi ws2_32)
 endif()
 
 # Dead code elimination
