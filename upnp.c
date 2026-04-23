@@ -56,7 +56,7 @@ typedef int socklen_t;
 
 #define SSDP_ADDR             "239.255.255.250"
 #define SSDP_PORT             1900
-#define SSDP_TIMEOUT_MS       1000
+#define SSDP_TIMEOUT_MS       3000
 #define UPNP_HTTP_TIMEOUT_SEC 5
 
 #define UPNP_PORT_RETRY_MAX   10    /* max port candidates on conflict */
